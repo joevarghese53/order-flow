@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless order processing with conditional stock reservation, SNS notifications and a DLQ alarm
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for DLQ alarms. Leave empty to skip. AWS sends a confirmation email you must accept.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 15
+    Environment:
+      Variables:
+        ORDERS_TABLE: !Ref OrdersTable
+        PRODUCTS_TABLE: !Ref ProductsTable
+        INVENTORY_TABLE: !Ref InventoryTable
+        ORDERS_QUEUE_URL: !Ref OrdersQueue
+        ORDER_EVENTS_TOPIC_ARN: !Ref OrderEventsTopic
+        CATALOG_CACHE_SIZE: "256"
+
+Resources:
+  # ---------- Data ----------
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: sku, AttributeType: S}
+      KeySchema:
+        - {AttributeName: sku, KeyType: HASH}
+
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: sku, AttributeType: S}
+        - {AttributeName: warehouse_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: sku, KeyType: HASH}
+        - {AttributeName: warehouse_id, KeyType: RANGE}
+
+  # ---------- Messaging ----------
+  OrdersDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days, the maximum
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 360  # 6x the 60s worker timeout, as AWS recommends for Lambda SQS sources
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+        maxReceiveCount: 3
+
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Order status events
+
+  OpsAlertsTopic:
+    Type: AWS::SNS::Topic
+
+  OpsAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref OpsAlertsTopic
+
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages reached the orders dead-letter queue. Orders failed after 3 attempts.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt OrdersDLQ.QueueName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
+
+  # ---------- API ----------
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20  # cost and abuse guard; raise deliberately
+
+  PlaceOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: orders.handlers.place_order
+      Description: POST /orders. Validates, stores the order once per Idempotency-Key, enqueues it.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:TransactWriteItems]
+              Resource: !GetAtt OrdersTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem]
+              Resource: !GetAtt ProductsTable.Arn
+            - Effect: Allow
+              Action: [sqs:SendMessage]
+              Resource: !GetAtt OrdersQueue.Arn
+      Events:
+        PlaceOrder:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /orders
+            Method: POST
+
+  GetOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: orders.handlers.get_order
+      Description: GET /orders/{order_id}
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem]
+              Resource: !GetAtt OrdersTable.Arn
+      Events:
+        GetOrder:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /orders/{order_id}
+            Method: GET
+
+  # ---------- Worker ----------
+  OrderWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: orders.handlers.process_orders
+      Timeout: 60
+      Description: Reserves stock for queued orders in deadline order and publishes status events.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:TransactWriteItems]
+              Resource:
+                - !GetAtt OrdersTable.Arn
+                - !GetAtt InventoryTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem]
+              Resource: !GetAtt ProductsTable.Arn
+            - Effect: Allow
+              Action: [sns:Publish]
+              Resource: !Ref OrderEventsTopic
+      Events:
+        Orders:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrdersQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for POST /orders
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  OrderEventsTopicArn:
+    Value: !Ref OrderEventsTopic
+  DeadLetterQueueUrl:
+    Value: !Ref OrdersDLQ
+  OrdersTableName:
+    Value: !Ref OrdersTable
+  ProductsTableName:
+    Value: !Ref ProductsTable
+  InventoryTableName:
+    Value: !Ref InventoryTable
